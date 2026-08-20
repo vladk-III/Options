@@ -1,0 +1,50 @@
+name: Collect Options Data
+
+on:
+  schedule:
+    # Two triggers to survive the EST/EDT switch -- 10:30am ET is either
+    # 14:30 UTC (EDT, roughly Mar-Nov) or 15:30 UTC (EST, roughly Nov-Mar).
+    # collect_headless.py checks the real US/Eastern clock and skips the
+    # one that isn't actually ~10:30am local, so only one ever does
+    # anything on a given day.
+    - cron: '30 14 * * 1-5'
+    - cron: '30 15 * * 1-5'
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write   # needed to commit the updated CSV back to the repo
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google service account key
+        run: echo "$GCP_SA_KEY" > service_account.json
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Run collection
+        run: python collect_headless.py
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+
+      - name: Remove service account key
+        if: always()
+        run: rm -f service_account.json
+
+      - name: Commit updated CSV
+        run: |
+          git config user.name "options-data-bot"
+          git config user.email "actions@github.com"
+          git add options_data.csv
+          git diff --staged --quiet || git commit -m "Update options data $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
