@@ -27,19 +27,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Write Google service account key
-        run: echo "$GCP_SA_KEY" > service_account.json
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-
       - name: Run collection
         run: python collect_headless.py
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-
-      - name: Remove service account key
-        if: always()
-        run: rm -f service_account.json
 
       - name: Commit updated CSV
         run: |
