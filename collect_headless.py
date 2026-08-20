@@ -6,31 +6,25 @@ Each run:
   1. Checks the real US/Eastern clock and exits immediately if it isn't
      close to 10:30am ET (handles the two DST-offset cron triggers without
      double-collecting -- see the workflow file for why there are two).
-  2. Loads whatever's already in the Google Sheet.
+  2. Loads whatever's already in options_data.csv (checked out from the repo).
   3. Collects a fresh snapshot (price + options features + Greeks) for
      every tracked ticker, upserting into start/intermediate/end for the
-     current week exactly like the Colab dashboard does.
-  4. Writes the updated data back to the Google Sheet AND saves it as
-     options_data.csv in this repo, which the workflow then commits --
-     so you can pull the CSV directly from GitHub whenever you want,
-     independent of the Sheet.
+     current week -- same rules as the Colab dashboard.
+  4. Saves the updated options_data.csv, which the workflow then commits
+     back to the repo.
 
-Required GitHub Actions secrets (see SETUP.md):
-  GCP_SA_KEY  -- the Google service account's JSON key, as a single secret
-  SHEET_ID    -- the target Google Sheet's ID (from its URL)
+No credentials or secrets needed at all -- just this script and a repo
+with Actions enabled (and "Read and write permissions" turned on so the
+workflow can push its own commits -- see SETUP.md).
 """
 import os
-import sys
 import time
-import json
 import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import gspread
-from google.oauth2.service_account import Credentials
 from scipy.stats import norm
 
 # ---------------------------------------------------------
@@ -60,8 +54,6 @@ OPTIONS_COLUMNS = ["ticker", "week_start", "snapshot_type", "snapshot_date", "pr
 WEEK_POSITION_LABELS = {"start": "Start of Week", "intermediate": "Midweek", "end": "End of Week"}
 
 CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "options_data.csv")
-SHEET_WORKSHEET_NAME = "options_data"
-SHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # How close to 10:30am ET we need to be for the run to actually proceed
 # (the workflow fires at both possible UTC offsets to survive DST, and
@@ -222,37 +214,22 @@ def fetch_option_snapshot(yf_symbol, risk_free_rate):
 
 
 # ---------------------------------------------------------
-# GOOGLE SHEETS I/O
+# CSV I/O
 # ---------------------------------------------------------
-def get_worksheet():
-    creds = Credentials.from_service_account_file("service_account.json", scopes=SHEET_SCOPES)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(os.environ["SHEET_ID"])
-    try:
-        ws = sh.worksheet(SHEET_WORKSHEET_NAME)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SHEET_WORKSHEET_NAME, rows=2000, cols=len(OPTIONS_COLUMNS) + 2)
-        ws.update([OPTIONS_COLUMNS])
-    return ws
-
-
-def load_existing(ws):
-    values = ws.get_all_values()
-    if len(values) < 2:
+def load_existing():
+    if not os.path.exists(CSV_PATH):
         return pd.DataFrame(columns=OPTIONS_COLUMNS)
-    header, data_rows = values[0], values[1:]
-    df = pd.DataFrame(data_rows, columns=header)
+    df = pd.read_csv(CSV_PATH)
+    if df.empty:
+        return pd.DataFrame(columns=OPTIONS_COLUMNS)
     for c in ["price"] + FEATURE_COLS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
-def save_all(ws, df):
-    df_out = df[OPTIONS_COLUMNS].copy()
-    values = [OPTIONS_COLUMNS] + df_out.astype(object).where(pd.notna(df_out), "").values.tolist()
-    ws.clear()
-    ws.update(values)
+def save_all(df):
+    df[OPTIONS_COLUMNS].to_csv(CSV_PATH, index=False)
 
 
 # ---------------------------------------------------------
@@ -289,19 +266,14 @@ def main():
     if not should_run_now():
         return
 
-    ws = get_worksheet()
-    df = load_existing(ws)
-    if df.empty:
-        df = pd.DataFrame(columns=OPTIONS_COLUMNS)
-
+    df = load_existing()
     risk_free_rate = fetch_risk_free_rate()
     for ticker in TICKERS:
         df = upsert_snapshot(df, ticker, risk_free_rate)
         time.sleep(REQUEST_DELAY_SECONDS)
 
-    save_all(ws, df)
-    df.to_csv(CSV_PATH, index=False)
-    print(f"\nDone. {len(df)} total rows. Sheet and {CSV_PATH} updated.")
+    save_all(df)
+    print(f"\nDone. {len(df)} total rows. {CSV_PATH} updated.")
 
 
 if __name__ == "__main__":
