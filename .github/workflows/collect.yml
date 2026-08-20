@@ -29,6 +29,8 @@ jobs:
 
       - name: Run collection
         run: python collect_headless.py
+        env:
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
 
       - name: Commit updated CSV
         run: |
