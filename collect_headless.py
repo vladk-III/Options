@@ -75,13 +75,13 @@ def should_run_now():
         print("Manually triggered -- running regardless of time.")
         return True
 
-    now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
-    if now_et.weekday() >= 5:
-        print(f"{now_et}: weekend -- skipping.")
+    current = now_et()
+    if current.weekday() >= 5:
+        print(f"{current}: weekend -- skipping.")
         return False
-    target = now_et.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
-    if abs((now_et - target).total_seconds()) > WINDOW_MINUTES * 60:
-        print(f"{now_et}: not within {WINDOW_MINUTES} min of {TARGET_HOUR}:{TARGET_MINUTE:02d} ET -- skipping.")
+    target = current.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
+    if abs((current - target).total_seconds()) > WINDOW_MINUTES * 60:
+        print(f"{current}: not within {WINDOW_MINUTES} min of {TARGET_HOUR}:{TARGET_MINUTE:02d} ET -- skipping.")
         return False
     return True
 
@@ -89,13 +89,26 @@ def should_run_now():
 # ---------------------------------------------------------
 # WEEK / SNAPSHOT LABELING (same rules as the Colab dashboard)
 # ---------------------------------------------------------
+def now_et():
+    return datetime.datetime.now(ZoneInfo("America/New_York"))
+
+
+def today_et():
+    """The current date in US/Eastern time (handles EST/EDT automatically).
+    GitHub Actions runners default to UTC, so using this instead of
+    datetime.date.today() everywhere keeps snapshot_date, week_start, and
+    the start/midweek/end labeling all anchored to the US market's actual
+    calendar day, not the runner's."""
+    return now_et().date()
+
+
 def get_week_start(d=None):
-    d = d or datetime.date.today()
+    d = d or today_et()
     return d - datetime.timedelta(days=d.weekday())
 
 
 def determine_snapshot_type(today=None):
-    d = today or datetime.date.today()
+    d = today or today_et()
     wd = d.weekday()
     if wd in (0, 1):
         return "start"
@@ -162,26 +175,102 @@ def black_scholes_greeks(S, K, T, r, sigma, option_type):
     return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega, "rho": rho}
 
 
+STRIKE_OFFSETS = [-2, -1, 0, 1, 2]  # 0 = closest strike to spot, then 2 below / 2 above
+STRIKE_COLUMNS = [
+    "ticker", "week_start", "snapshot_type", "snapshot_date", "option_type", "strike_offset",
+    "strike", "last_price", "bid", "ask", "volume", "open_interest",
+    "implied_volatility", "delta", "gamma", "theta", "vega", "rho",
+]
+STRIKE_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strike_level_data.csv")
+
+
+def pick_expiration(expirations):
+    """Skips same-day (0DTE) expirations when a later one is available --
+    using a 0DTE expiration makes time-to-expiry 0 for the whole chain,
+    which zeroes out every Greek (this is why SPY/QQQ/IWM -- all very
+    liquid 0DTE names -- were showing blank Greeks before this fix)."""
+    today = today_et()
+    for exp in expirations:
+        if datetime.date.fromisoformat(exp) > today:
+            return exp
+    return expirations[0] if expirations else None
+
+
+def extract_near_strikes(price, calls, puts, call_greeks, put_greeks):
+    """Returns per-contract rows (call AND put) for the strikes immediately
+    around the current price: the closest strike, plus 2 below and 2 above
+    it (5 strike levels x 2 sides = up to 10 rows)."""
+    call_strikes = calls["strike"].to_numpy() if len(calls) else np.array([])
+    put_strikes = puts["strike"].to_numpy() if len(puts) else np.array([])
+    all_strikes = sorted(set(call_strikes.tolist()) | set(put_strikes.tolist()))
+    if not all_strikes:
+        return []
+
+    closest_idx = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - price))
+
+    def contract_row(strikes_arr, side_df, greeks, strike):
+        matches = np.where(np.isclose(strikes_arr, strike))[0]
+        if len(matches) == 0:
+            return None
+        i = int(matches[0])
+        r = side_df.iloc[i]
+        return {
+            "last_price": float(r.get("lastPrice", np.nan)),
+            "bid": float(r.get("bid", np.nan)),
+            "ask": float(r.get("ask", np.nan)),
+            "volume": float(r.get("volume", np.nan)),
+            "open_interest": float(r.get("openInterest", np.nan)),
+            "implied_volatility": float(r.get("impliedVolatility", np.nan)),
+            "delta": float(greeks["delta"][i]) if greeks is not None else np.nan,
+            "gamma": float(greeks["gamma"][i]) if greeks is not None else np.nan,
+            "theta": float(greeks["theta"][i]) if greeks is not None else np.nan,
+            "vega": float(greeks["vega"][i]) if greeks is not None else np.nan,
+            "rho": float(greeks["rho"][i]) if greeks is not None else np.nan,
+        }
+
+    rows = []
+    for offset in STRIKE_OFFSETS:
+        idx = closest_idx + offset
+        if idx < 0 or idx >= len(all_strikes):
+            continue
+        strike = all_strikes[idx]
+        for option_type, strikes_arr, side_df, greeks in [
+            ("call", call_strikes, calls, call_greeks),
+            ("put", put_strikes, puts, put_greeks),
+        ]:
+            data = contract_row(strikes_arr, side_df, greeks, strike)
+            if data is None:
+                continue
+            row = {"option_type": option_type, "strike_offset": offset, "strike": strike}
+            row.update(data)
+            rows.append(row)
+    return rows
+
+
 def fetch_option_snapshot(yf_symbol, risk_free_rate):
+    """Returns (price, aggregate_features_dict, near_strike_rows).
+    aggregate_features_dict is the whole-chain summary (same shape as
+    before); near_strike_rows is per-contract detail for the 5 strikes
+    around spot (see extract_near_strikes)."""
     price = fetch_current_price(yf_symbol)
     if price is None:
-        return None, None
+        return None, None, []
     try:
         tk = yf.Ticker(yf_symbol)
         expirations = tk.options
         if not expirations:
-            return price, None
-        expiration = expirations[0]
+            return price, None, []
+        expiration = pick_expiration(expirations)
         chain = tk.option_chain(expiration)
         calls, puts = chain.calls.copy(), chain.puts.copy()
     except Exception:
-        return price, None
+        return price, None, []
 
     for df in (calls, puts):
         df["volume"] = df["volume"].fillna(0)
         df["openInterest"] = df["openInterest"].fillna(0)
 
-    T = max((datetime.date.fromisoformat(expiration) - datetime.date.today()).days, 0) / 365.0
+    T = max((datetime.date.fromisoformat(expiration) - today_et()).days, 0) / 365.0
 
     call_greeks = black_scholes_greeks(price, calls["strike"].to_numpy(), T, risk_free_rate,
                                         calls["impliedVolatility"].to_numpy(), "call") if len(calls) else None
@@ -218,7 +307,9 @@ def fetch_option_snapshot(yf_symbol, risk_free_rate):
         "avg_call_rho": nanmean(call_greeks["rho"]) if call_greeks is not None else np.nan,
         "avg_put_rho": nanmean(put_greeks["rho"]) if put_greeks is not None else np.nan,
     }
-    return price, features
+
+    near_strike_rows = extract_near_strikes(price, calls, puts, call_greeks, put_greeks)
+    return price, features, near_strike_rows
 
 
 # ---------------------------------------------------------
@@ -240,19 +331,40 @@ def save_all(df):
     df[OPTIONS_COLUMNS].to_csv(CSV_PATH, index=False)
 
 
+def load_existing_strikes():
+    if not os.path.exists(STRIKE_CSV_PATH):
+        return pd.DataFrame(columns=STRIKE_COLUMNS)
+    df = pd.read_csv(STRIKE_CSV_PATH)
+    if df.empty:
+        return pd.DataFrame(columns=STRIKE_COLUMNS)
+    numeric_cols = ["strike", "last_price", "bid", "ask", "volume", "open_interest",
+                     "implied_volatility", "delta", "gamma", "theta", "vega", "rho"]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def save_all_strikes(df):
+    df[STRIKE_COLUMNS].to_csv(STRIKE_CSV_PATH, index=False)
+
+
 # ---------------------------------------------------------
 # COLLECTION (upsert, same rules as the Colab dashboard)
 # ---------------------------------------------------------
-def upsert_snapshot(df, ticker, risk_free_rate):
+def upsert_snapshot(df, strikes_df, ticker, risk_free_rate):
+    """Updates both the aggregate weekly row (df) and the near-strike
+    detail rows (strikes_df) for this ticker's current snapshot."""
     yf_symbol = TICKER_YF_SYMBOL.get(ticker, ticker)
     snapshot_type = determine_snapshot_type()
-    price, features = fetch_option_snapshot(yf_symbol, risk_free_rate)
+    price, features, strike_rows = fetch_option_snapshot(yf_symbol, risk_free_rate)
     if price is None:
         print(f"{ticker}: could not fetch data right now.")
-        return df
+        return df, strikes_df
 
     week_start = get_week_start().isoformat()
-    today_str = datetime.date.today().isoformat()
+    today_str = today_et().isoformat()
+
     row = {"ticker": ticker, "week_start": week_start, "snapshot_type": snapshot_type,
            "snapshot_date": today_str, "price": price}
     row.update(features or {c: np.nan for c in FEATURE_COLS})
@@ -266,8 +378,25 @@ def upsert_snapshot(df, ticker, risk_free_rate):
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
         action = "recorded"
 
-    print(f"{ticker}: {action} {WEEK_POSITION_LABELS[snapshot_type]} snapshot (${price:.2f}).")
-    return df
+    # near-strike detail rows: same upsert key plus option_type + strike_offset
+    for sr in strike_rows:
+        srow = {"ticker": ticker, "week_start": week_start, "snapshot_type": snapshot_type,
+                "snapshot_date": today_str}
+        srow.update(sr)
+        smask = ((strikes_df["ticker"] == ticker) & (strikes_df["week_start"] == week_start) &
+                  (strikes_df["snapshot_type"] == snapshot_type) &
+                  (strikes_df["option_type"] == sr["option_type"]) &
+                  (strikes_df["strike_offset"] == sr["strike_offset"]))
+        if smask.any():
+            for k, v in srow.items():
+                strikes_df.loc[smask, k] = v
+        else:
+            strikes_df = pd.concat([strikes_df, pd.DataFrame([srow])], ignore_index=True)
+
+    n_strikes = len(set((r["strike_offset"] for r in strike_rows)))
+    print(f"{ticker}: {action} {WEEK_POSITION_LABELS[snapshot_type]} snapshot (${price:.2f}), "
+          f"{len(strike_rows)} near-strike contract rows across {n_strikes} strike levels.")
+    return df, strikes_df
 
 
 def main():
@@ -275,13 +404,16 @@ def main():
         return
 
     df = load_existing()
+    strikes_df = load_existing_strikes()
     risk_free_rate = fetch_risk_free_rate()
     for ticker in TICKERS:
-        df = upsert_snapshot(df, ticker, risk_free_rate)
+        df, strikes_df = upsert_snapshot(df, strikes_df, ticker, risk_free_rate)
         time.sleep(REQUEST_DELAY_SECONDS)
 
     save_all(df)
-    print(f"\nDone. {len(df)} total rows. {CSV_PATH} updated.")
+    save_all_strikes(strikes_df)
+    print(f"\nDone. {len(df)} weekly summary rows ({CSV_PATH}), "
+          f"{len(strikes_df)} near-strike detail rows ({STRIKE_CSV_PATH}).")
 
 
 if __name__ == "__main__":
