@@ -67,6 +67,14 @@ WINDOW_MINUTES = 20
 # TIME GATE
 # ---------------------------------------------------------
 def should_run_now():
+    # A manual trigger (the "Run workflow" button) should always run,
+    # regardless of what time it is -- the whole point of testing manually
+    # is to see it work right now. Only the scheduled cron runs are
+    # restricted to the ~10:30am ET window (see FORCE_RUN in the workflow).
+    if os.environ.get("FORCE_RUN") == "true":
+        print("Manually triggered -- running regardless of time.")
+        return True
+
     now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
     if now_et.weekday() >= 5:
         print(f"{now_et}: weekend -- skipping.")
