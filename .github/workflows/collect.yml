@@ -32,10 +32,21 @@ jobs:
         env:
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
 
-      - name: Commit updated CSV
+      - name: Show actual file status (debug)
+        run: |
+          echo "--- options_data.csv ---"
+          wc -l options_data.csv
+          echo "--- strike_level_data.csv ---"
+          wc -l strike_level_data.csv
+          echo "--- .gitignore (if any) ---"
+          cat .gitignore 2>/dev/null || echo "(no .gitignore file)"
+          echo "--- git status ---"
+          git status
+
+      - name: Commit updated CSVs
         run: |
           git config user.name "options-data-bot"
           git config user.email "actions@github.com"
-          git add options_data.csv
+          git add options_data.csv strike_level_data.csv
           git diff --staged --quiet || git commit -m "Update options data $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
