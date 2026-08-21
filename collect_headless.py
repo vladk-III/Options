@@ -60,7 +60,7 @@ CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "options_dat
 # this window keeps only the one that's actually ~10:30 local from doing
 # anything).
 TARGET_HOUR, TARGET_MINUTE = 10, 30
-WINDOW_MINUTES = 20
+WINDOW_MINUTES = 40  # widened from 20 -- GitHub's cron scheduling can drift more than that
 
 
 # ---------------------------------------------------------
