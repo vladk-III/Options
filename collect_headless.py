@@ -2,22 +2,47 @@
 Headless daily options data collector -- runs in GitHub Actions on a
 schedule (see .github/workflows/collect.yml), no notebook needed.
 
-Each run:
-  1. Checks the real US/Eastern clock and exits immediately if it isn't
-     close to 10:30am ET (handles the two DST-offset cron triggers without
-     double-collecting -- see the workflow file for why there are two).
-  2. Loads whatever's already in options_data.csv (checked out from the repo).
-  3. Collects a fresh snapshot (price + options features + Greeks) for
-     every tracked ticker, upserting into start/intermediate/end for the
-     current week -- same rules as the Colab dashboard.
-  4. Saves the updated options_data.csv, which the workflow then commits
-     back to the repo.
+Two prediction targets, by ticker group:
+  - DAILY_TICKERS (the 11 names with Mon/Wed/Fri or full daily listed
+    expirations): target = NEXT TRADING DAY's price. For these, the
+    "aligned" expiration fetched is whichever one actually expires on
+    that next trading day (or the nearest one after it).
+  - Everyone else: target = this week's Friday close, as before. The
+    "weekly" expiration IS the aligned one for this group.
 
-No credentials or secrets needed at all -- just this script and a repo
-with Actions enabled (and "Read and write permissions" turned on so the
-workflow can push its own commits -- see SETUP.md).
+For every ticker, three roles are fetched where available -- "aligned"
+(daily-tickers only), "weekly" (nearest Friday), "monthly" (~30 DTE) --
+deduped by actual date (if two roles land on the same expiration, that's
+one fetch, tagged with both role names). Each fetched expiration gets:
+  - a FROZEN "initial_length_bucket" label (0-1/2-4/5-9/10-19/20-45/45+
+    calendar days), assigned the first time that exact (ticker,
+    expiration_date) pair is ever seen and never recomputed after -- by
+    checking whether strike_level_data.csv already has a row for that
+    pair, so the label doesn't drift as the same contract approaches
+    expiry across multiple collection days.
+  - live (recomputed daily) trading_days_to_expiration and
+    trading_days_to_target numbers.
+  - near-strike detail (2 strikes above/below spot, both calls and puts,
+    with self-computed Black-Scholes Greeks) in strike_level_data.csv.
+
+Three files, all upserted in place (re-running the same day refreshes
+existing rows rather than duplicating):
+  - options_data.csv        -- weekly aggregate summary (unchanged shape
+                                from before), sourced from the "weekly"
+                                role expiration specifically.
+  - strike_level_data.csv   -- per-contract detail, see above -- this is
+                                also where the frozen initial-length-bucket
+                                labels effectively live (no separate file).
+  - daily_data.csv          -- simple (ticker, date) -> price ledger,
+                                DAILY_TICKERS only -- the target series
+                                for next-day prediction.
+
+No credentials or secrets needed -- just this script, a repo with
+Actions enabled, and "Read and write permissions" turned on (see
+SETUP.md).
 """
 import os
+import sys
 import time
 import datetime
 from zoneinfo import ZoneInfo
@@ -28,7 +53,7 @@ import yfinance as yf
 from scipy.stats import norm
 
 # ---------------------------------------------------------
-# CONFIG (kept in sync with dashboard.py's Colab app)
+# CONFIG (kept in sync with dashboard.py's Colab app, where applicable)
 # ---------------------------------------------------------
 TICKER_YF_SYMBOL = {
     "SPY": "SPY", "QQQ": "QQQ", "SPX": "^GSPC", "TSLA": "TSLA", "NVDA": "NVDA",
@@ -39,8 +64,15 @@ TICKER_YF_SYMBOL = {
     "SHOP": "SHOP", "SQ": "SQ", "XOM": "XOM", "AMD": "AMD", "BAC": "BAC",
 }
 TICKERS = list(TICKER_YF_SYMBOL.keys())
-REQUEST_DELAY_SECONDS = 0.4
+
+# Names with same-week (daily or Mon/Wed/Fri) listed expirations, as of
+# early 2026 -- predicted target for these is NEXT TRADING DAY's price,
+# not end-of-week. Update this set if the exchange adds/removes names.
+DAILY_TICKERS = {"SPY", "QQQ", "IWM", "AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA", "IBIT"}
+
+REQUEST_DELAY_SECONDS = 0.6  # bumped from 0.4 -- more requests/run now, more spacing to be polite to Yahoo
 DEFAULT_RISK_FREE_RATE = 0.045
+MIN_T_YEARS = 6.5 / (24 * 365)  # ~6.5 trading hours, floor for a same-day target expiration (e.g. Friday-target on a Friday)
 
 FEATURE_COLS = [
     "avg_call_iv", "avg_put_iv", "iv_skew", "call_volume", "put_volume",
@@ -52,53 +84,33 @@ FEATURE_COLS = [
 ]
 OPTIONS_COLUMNS = ["ticker", "week_start", "snapshot_type", "snapshot_date", "price"] + FEATURE_COLS
 WEEK_POSITION_LABELS = {"start": "Start of Week", "intermediate": "Midweek", "end": "End of Week"}
-
 CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "options_data.csv")
 
-# How close to 10:30am ET we need to be for the run to actually proceed
-# (the workflow fires at both possible UTC offsets to survive DST, and
-# this window keeps only the one that's actually ~10:30 local from doing
-# anything).
+STRIKE_OFFSETS = [-2, -1, 0, 1, 2]  # 0 = closest strike to spot, then 2 below / 2 above
+STRIKE_COLUMNS = [
+    "ticker", "snapshot_date", "week_start", "week_position", "role", "expiration_date",
+    "initial_length_bucket", "trading_days_to_expiration", "trading_days_to_target",
+    "option_type", "strike_offset", "strike", "last_price", "bid", "ask", "volume",
+    "open_interest", "implied_volatility", "delta", "gamma", "theta", "vega", "rho",
+]
+STRIKE_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strike_level_data.csv")
+
+DAILY_COLUMNS = ["ticker", "snapshot_date", "price"]
+DAILY_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_data.csv")
+
 TARGET_HOUR, TARGET_MINUTE = 10, 30
-WINDOW_MINUTES = 40  # widened from 20 -- GitHub's cron scheduling can drift more than that
+WINDOW_MINUTES = 40
+ALERT_HOUR, ALERT_MINUTE = 12, 0
 
 
 # ---------------------------------------------------------
-# TIME GATE
-# ---------------------------------------------------------
-def should_run_now():
-    # A manual trigger (the "Run workflow" button) should always run,
-    # regardless of what time it is -- the whole point of testing manually
-    # is to see it work right now. Only the scheduled cron runs are
-    # restricted to the ~10:30am ET window (see FORCE_RUN in the workflow).
-    if os.environ.get("FORCE_RUN") == "true":
-        print("Manually triggered -- running regardless of time.")
-        return True
-
-    current = now_et()
-    if current.weekday() >= 5:
-        print(f"{current}: weekend -- skipping.")
-        return False
-    target = current.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
-    if abs((current - target).total_seconds()) > WINDOW_MINUTES * 60:
-        print(f"{current}: not within {WINDOW_MINUTES} min of {TARGET_HOUR}:{TARGET_MINUTE:02d} ET -- skipping.")
-        return False
-    return True
-
-
-# ---------------------------------------------------------
-# WEEK / SNAPSHOT LABELING (same rules as the Colab dashboard)
+# TIME / CALENDAR HELPERS
 # ---------------------------------------------------------
 def now_et():
     return datetime.datetime.now(ZoneInfo("America/New_York"))
 
 
 def today_et():
-    """The current date in US/Eastern time (handles EST/EDT automatically).
-    GitHub Actions runners default to UTC, so using this instead of
-    datetime.date.today() everywhere keeps snapshot_date, week_start, and
-    the start/midweek/end labeling all anchored to the US market's actual
-    calendar day, not the runner's."""
     return now_et().date()
 
 
@@ -107,8 +119,9 @@ def get_week_start(d=None):
     return d - datetime.timedelta(days=d.weekday())
 
 
-def determine_snapshot_type(today=None):
-    d = today or today_et()
+def determine_snapshot_type(d=None):
+    """Mon/Tue -> start, Wed -> intermediate, Thu/Fri/weekend -> end."""
+    d = d or today_et()
     wd = d.weekday()
     if wd in (0, 1):
         return "start"
@@ -117,8 +130,89 @@ def determine_snapshot_type(today=None):
     return "end"
 
 
+def next_trading_day(d):
+    nd = d + datetime.timedelta(days=1)
+    while nd.weekday() >= 5:
+        nd += datetime.timedelta(days=1)
+    return nd
+
+
+def upcoming_friday(d):
+    days_ahead = (4 - d.weekday()) % 7  # Friday = 4; if d IS Friday, returns d itself
+    return d + datetime.timedelta(days=days_ahead)
+
+
+def trading_days_between(start_date, end_date):
+    """Number of weekday steps from start_date (exclusive) to end_date
+    (inclusive). 0 if end_date <= start_date."""
+    if end_date <= start_date:
+        return 0
+    count = 0
+    d = start_date
+    while d < end_date:
+        d += datetime.timedelta(days=1)
+        if d.weekday() < 5:
+            count += 1
+    return count
+
+
+def classify_length_bucket(calendar_days_to_expiration):
+    d = max(calendar_days_to_expiration, 0)
+    if d <= 1:
+        return "0-1_day"
+    if d <= 4:
+        return "2-4_day"
+    if d <= 9:
+        return "5-9_day"
+    if d <= 19:
+        return "10-19_day"
+    if d <= 45:
+        return "20-45_day"
+    return "45+_day"
+
+
 # ---------------------------------------------------------
-# DATA FETCH (yfinance + self-computed Black-Scholes Greeks)
+# WATCHDOG / TIME GATE
+# ---------------------------------------------------------
+def already_collected_today():
+    if not os.path.exists(CSV_PATH):
+        return False
+    try:
+        df = pd.read_csv(CSV_PATH, usecols=["snapshot_date"])
+    except Exception:
+        return False
+    if df.empty:
+        return False
+    return (df["snapshot_date"] == today_et().isoformat()).any()
+
+
+def should_run_now():
+    if os.environ.get("FORCE_RUN") == "true":
+        print("Manually triggered -- running regardless of time.")
+        return True
+
+    current = now_et()
+    if current.weekday() >= 5:
+        print(f"{current}: weekend -- skipping.")
+        return False
+
+    target = current.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
+    if abs((current - target).total_seconds()) <= WINDOW_MINUTES * 60:
+        return True
+
+    alert_time = current.replace(hour=ALERT_HOUR, minute=ALERT_MINUTE, second=0, microsecond=0)
+    if current >= alert_time and not already_collected_today():
+        print(f"ALERT: it's {current} and nothing has been collected today. "
+              f"Failing this run on purpose so GitHub emails you about it -- "
+              f"trigger 'Run workflow' manually to collect today's data.")
+        sys.exit(1)
+
+    print(f"{current}: not within {WINDOW_MINUTES} min of {TARGET_HOUR}:{TARGET_MINUTE:02d} ET -- skipping.")
+    return False
+
+
+# ---------------------------------------------------------
+# PRICE / RATE FETCH
 # ---------------------------------------------------------
 def fetch_current_price(yf_symbol):
     try:
@@ -140,6 +234,9 @@ def fetch_risk_free_rate():
     return DEFAULT_RISK_FREE_RATE
 
 
+# ---------------------------------------------------------
+# BLACK-SCHOLES GREEKS (self-computed -- no paid data source needed)
+# ---------------------------------------------------------
 def black_scholes_greeks(S, K, T, r, sigma, option_type):
     K = np.asarray(K, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
@@ -175,31 +272,16 @@ def black_scholes_greeks(S, K, T, r, sigma, option_type):
     return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega, "rho": rho}
 
 
-STRIKE_OFFSETS = [-2, -1, 0, 1, 2]  # 0 = closest strike to spot, then 2 below / 2 above
-STRIKE_COLUMNS = [
-    "ticker", "week_start", "snapshot_type", "snapshot_date", "option_type", "strike_offset",
-    "strike", "last_price", "bid", "ask", "volume", "open_interest",
-    "implied_volatility", "delta", "gamma", "theta", "vega", "rho",
-]
-STRIKE_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strike_level_data.csv")
-
-
-def pick_expiration(expirations):
-    """Skips same-day (0DTE) expirations when a later one is available --
-    using a 0DTE expiration makes time-to-expiry 0 for the whole chain,
-    which zeroes out every Greek (this is why SPY/QQQ/IWM -- all very
-    liquid 0DTE names -- were showing blank Greeks before this fix)."""
-    today = today_et()
-    for exp in expirations:
-        if datetime.date.fromisoformat(exp) > today:
-            return exp
-    return expirations[0] if expirations else None
+def compute_T(expiration_date, today):
+    days = (expiration_date - today).days
+    if days <= 0:
+        return MIN_T_YEARS  # same-day target (e.g. Friday-role on a Friday) -- approximate, not zero
+    return days / 365.0
 
 
 def extract_near_strikes(price, calls, puts, call_greeks, put_greeks):
-    """Returns per-contract rows (call AND put) for the strikes immediately
-    around the current price: the closest strike, plus 2 below and 2 above
-    it (5 strike levels x 2 sides = up to 10 rows)."""
+    """Per-contract rows (call AND put) for the closest strike to spot,
+    plus 2 below and 2 above it (up to 10 rows: 5 strike levels x 2 sides)."""
     call_strikes = calls["strike"].to_numpy() if len(calls) else np.array([])
     put_strikes = puts["strike"].to_numpy() if len(puts) else np.array([])
     all_strikes = sorted(set(call_strikes.tolist()) | set(put_strikes.tolist()))
@@ -247,34 +329,26 @@ def extract_near_strikes(price, calls, puts, call_greeks, put_greeks):
     return rows
 
 
-def fetch_option_snapshot(yf_symbol, risk_free_rate):
-    """Returns (price, aggregate_features_dict, near_strike_rows).
-    aggregate_features_dict is the whole-chain summary (same shape as
-    before); near_strike_rows is per-contract detail for the 5 strikes
-    around spot (see extract_near_strikes)."""
-    price = fetch_current_price(yf_symbol)
-    if price is None:
-        return None, None, []
+def fetch_chain_for_expiration(yf_symbol, expiration_str, spot_price, risk_free_rate, today):
+    """Fetches ONE specific expiration's chain. Returns (aggregate_features
+    dict, near_strike_rows list), or (None, []) if the fetch fails."""
     try:
         tk = yf.Ticker(yf_symbol)
-        expirations = tk.options
-        if not expirations:
-            return price, None, []
-        expiration = pick_expiration(expirations)
-        chain = tk.option_chain(expiration)
+        chain = tk.option_chain(expiration_str)
         calls, puts = chain.calls.copy(), chain.puts.copy()
     except Exception:
-        return price, None, []
+        return None, []
 
     for df in (calls, puts):
         df["volume"] = df["volume"].fillna(0)
         df["openInterest"] = df["openInterest"].fillna(0)
 
-    T = max((datetime.date.fromisoformat(expiration) - today_et()).days, 0) / 365.0
+    expiration_date = datetime.date.fromisoformat(expiration_str)
+    T = compute_T(expiration_date, today)
 
-    call_greeks = black_scholes_greeks(price, calls["strike"].to_numpy(), T, risk_free_rate,
+    call_greeks = black_scholes_greeks(spot_price, calls["strike"].to_numpy(), T, risk_free_rate,
                                         calls["impliedVolatility"].to_numpy(), "call") if len(calls) else None
-    put_greeks = black_scholes_greeks(price, puts["strike"].to_numpy(), T, risk_free_rate,
+    put_greeks = black_scholes_greeks(spot_price, puts["strike"].to_numpy(), T, risk_free_rate,
                                        puts["impliedVolatility"].to_numpy(), "put") if len(puts) else None
 
     def nanmean(arr):
@@ -308,8 +382,71 @@ def fetch_option_snapshot(yf_symbol, risk_free_rate):
         "avg_put_rho": nanmean(put_greeks["rho"]) if put_greeks is not None else np.nan,
     }
 
-    near_strike_rows = extract_near_strikes(price, calls, puts, call_greeks, put_greeks)
-    return price, features, near_strike_rows
+    near_strike_rows = extract_near_strikes(spot_price, calls, puts, call_greeks, put_greeks)
+    return features, near_strike_rows
+
+
+# ---------------------------------------------------------
+# EXPIRATION SELECTION
+# ---------------------------------------------------------
+def find_expiration_matching_or_nearest_after(expirations, target_date, floor_date):
+    """Exact match on target_date if listed; else nearest expiration >=
+    floor_date, closest to target_date. None if nothing qualifies."""
+    exact = [e for e in expirations if e == target_date]
+    if exact:
+        return target_date
+    candidates = [e for e in expirations if e >= floor_date]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda e: abs((e - target_date).days))
+
+
+def nearest_expiration_to_dte(expirations, today, target_dte):
+    if not expirations:
+        return None
+    return min(expirations, key=lambda e: abs((e - today).days - target_dte))
+
+
+def get_target_expirations(ticker, expirations, today):
+    """Returns {role_name: expiration_date} for this ticker -- 'aligned'
+    only for DAILY_TICKERS, 'weekly' and 'monthly' for everyone."""
+    if not expirations:
+        return {}
+    roles = {}
+
+    if ticker in DAILY_TICKERS:
+        target = next_trading_day(today)
+        aligned = find_expiration_matching_or_nearest_after(expirations, target, floor_date=target)
+        if aligned:
+            roles["aligned"] = aligned
+
+    friday_target = upcoming_friday(today)
+    weekly = find_expiration_matching_or_nearest_after(expirations, friday_target, floor_date=today)
+    if weekly:
+        roles["weekly"] = weekly
+
+    monthly = nearest_expiration_to_dte(expirations, today, target_dte=30)
+    if monthly:
+        roles["monthly"] = monthly
+
+    return roles
+
+
+# ---------------------------------------------------------
+# FROZEN INITIAL-LENGTH-BUCKET LOOKUP
+# ---------------------------------------------------------
+# No separate registry file -- the frozen label is derived by checking
+# whether strike_level_data.csv already has a row for this exact
+# (ticker, expiration_date). If so, that row's initial_length_bucket is
+# reused as-is (frozen); if this is the first time this expiration has
+# ever been seen, it's computed fresh from today's calendar-days-to-expiry.
+def get_or_freeze_bucket(strikes_df, ticker, expiration_date, today):
+    mask = (strikes_df["ticker"] == ticker) & (strikes_df["expiration_date"] == expiration_date.isoformat())
+    existing = strikes_df[mask]
+    if not existing.empty:
+        return existing.iloc[0]["initial_length_bucket"]
+    calendar_dte = (expiration_date - today).days
+    return classify_length_bucket(calendar_dte)
 
 
 # ---------------------------------------------------------
@@ -338,7 +475,8 @@ def load_existing_strikes():
     if df.empty:
         return pd.DataFrame(columns=STRIKE_COLUMNS)
     numeric_cols = ["strike", "last_price", "bid", "ask", "volume", "open_interest",
-                     "implied_volatility", "delta", "gamma", "theta", "vega", "rho"]
+                     "implied_volatility", "delta", "gamma", "theta", "vega", "rho",
+                     "trading_days_to_expiration", "trading_days_to_target"]
     for c in numeric_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -349,71 +487,128 @@ def save_all_strikes(df):
     df[STRIKE_COLUMNS].to_csv(STRIKE_CSV_PATH, index=False)
 
 
+def load_existing_daily():
+    if not os.path.exists(DAILY_CSV_PATH):
+        return pd.DataFrame(columns=DAILY_COLUMNS)
+    df = pd.read_csv(DAILY_CSV_PATH)
+    if df.empty:
+        return pd.DataFrame(columns=DAILY_COLUMNS)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    return df
+
+
+def save_all_daily(df):
+    df[DAILY_COLUMNS].to_csv(DAILY_CSV_PATH, index=False)
+
+
 # ---------------------------------------------------------
-# COLLECTION (upsert, same rules as the Colab dashboard)
+# PER-TICKER COLLECTION
 # ---------------------------------------------------------
-def upsert_snapshot(df, strikes_df, ticker, risk_free_rate):
-    """Updates both the aggregate weekly row (df) and the near-strike
-    detail rows (strikes_df) for this ticker's current snapshot."""
+def process_ticker(ticker, risk_free_rate, weekly_df, strikes_df, daily_df):
     yf_symbol = TICKER_YF_SYMBOL.get(ticker, ticker)
-    snapshot_type = determine_snapshot_type()
-    price, features, strike_rows = fetch_option_snapshot(yf_symbol, risk_free_rate)
+    today = today_et()
+    today_str = today.isoformat()
+
+    price = fetch_current_price(yf_symbol)
     if price is None:
-        print(f"{ticker}: could not fetch data right now.")
-        return df, strikes_df
+        return f"{ticker}: could not fetch price right now.", weekly_df, strikes_df, daily_df
 
-    week_start = get_week_start().isoformat()
-    today_str = today_et().isoformat()
+    try:
+        tk = yf.Ticker(yf_symbol)
+        raw_expirations = [datetime.date.fromisoformat(e) for e in tk.options]
+    except Exception:
+        raw_expirations = []
 
-    row = {"ticker": ticker, "week_start": week_start, "snapshot_type": snapshot_type,
-           "snapshot_date": today_str, "price": price}
-    row.update(features or {c: np.nan for c in FEATURE_COLS})
+    role_map = get_target_expirations(ticker, raw_expirations, today)
+    date_to_roles = {}
+    for role, exp_date in role_map.items():
+        date_to_roles.setdefault(exp_date, []).append(role)
 
-    mask = (df["ticker"] == ticker) & (df["week_start"] == week_start) & (df["snapshot_type"] == snapshot_type)
-    if mask.any():
-        for k, v in row.items():
-            df.loc[mask, k] = v
-        action = "refreshed"
+    week_start = get_week_start(today).isoformat()
+    week_position = WEEK_POSITION_LABELS[determine_snapshot_type(today)]
+    target_date = next_trading_day(today) if ticker in DAILY_TICKERS else upcoming_friday(today)
+
+    weekly_features = None
+    n_strike_rows_total = 0
+
+    for exp_date, roles in date_to_roles.items():
+        role_label = "+".join(sorted(roles))
+        features, strike_rows = fetch_chain_for_expiration(yf_symbol, exp_date.isoformat(), price, risk_free_rate, today)
+        if features is None:
+            continue
+        if "weekly" in roles:
+            weekly_features = features
+
+        bucket = get_or_freeze_bucket(strikes_df, ticker, exp_date, today)
+        trading_days_to_exp = trading_days_between(today, exp_date)
+        trading_days_to_tgt = trading_days_between(today, target_date)
+
+        for sr in strike_rows:
+            srow = {
+                "ticker": ticker, "snapshot_date": today_str, "week_start": week_start,
+                "week_position": week_position, "role": role_label, "expiration_date": exp_date.isoformat(),
+                "initial_length_bucket": bucket, "trading_days_to_expiration": trading_days_to_exp,
+                "trading_days_to_target": trading_days_to_tgt,
+            }
+            srow.update(sr)
+            smask = ((strikes_df["ticker"] == ticker) & (strikes_df["snapshot_date"] == today_str) &
+                      (strikes_df["expiration_date"] == exp_date.isoformat()) &
+                      (strikes_df["option_type"] == sr["option_type"]) &
+                      (strikes_df["strike_offset"] == sr["strike_offset"]))
+            if smask.any():
+                for k, v in srow.items():
+                    strikes_df.loc[smask, k] = v
+            else:
+                strikes_df = pd.concat([strikes_df, pd.DataFrame([srow])], ignore_index=True)
+        n_strike_rows_total += len(strike_rows)
+
+    # weekly aggregate row (options_data.csv), sourced from the "weekly" role expiration
+    snapshot_type = determine_snapshot_type(today)
+    wrow = {"ticker": ticker, "week_start": week_start, "snapshot_type": snapshot_type,
+            "snapshot_date": today_str, "price": price}
+    wrow.update(weekly_features or {c: np.nan for c in FEATURE_COLS})
+    wmask = (weekly_df["ticker"] == ticker) & (weekly_df["week_start"] == week_start) & (weekly_df["snapshot_type"] == snapshot_type)
+    if wmask.any():
+        for k, v in wrow.items():
+            weekly_df.loc[wmask, k] = v
     else:
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        action = "recorded"
+        weekly_df = pd.concat([weekly_df, pd.DataFrame([wrow])], ignore_index=True)
 
-    # near-strike detail rows: same upsert key plus option_type + strike_offset
-    for sr in strike_rows:
-        srow = {"ticker": ticker, "week_start": week_start, "snapshot_type": snapshot_type,
-                "snapshot_date": today_str}
-        srow.update(sr)
-        smask = ((strikes_df["ticker"] == ticker) & (strikes_df["week_start"] == week_start) &
-                  (strikes_df["snapshot_type"] == snapshot_type) &
-                  (strikes_df["option_type"] == sr["option_type"]) &
-                  (strikes_df["strike_offset"] == sr["strike_offset"]))
-        if smask.any():
-            for k, v in srow.items():
-                strikes_df.loc[smask, k] = v
+    # daily price ledger, DAILY_TICKERS only -- the target series for next-day prediction
+    if ticker in DAILY_TICKERS:
+        dmask = (daily_df["ticker"] == ticker) & (daily_df["snapshot_date"] == today_str)
+        drow = {"ticker": ticker, "snapshot_date": today_str, "price": price}
+        if dmask.any():
+            for k, v in drow.items():
+                daily_df.loc[dmask, k] = v
         else:
-            strikes_df = pd.concat([strikes_df, pd.DataFrame([srow])], ignore_index=True)
+            daily_df = pd.concat([daily_df, pd.DataFrame([drow])], ignore_index=True)
 
-    n_strikes = len(set((r["strike_offset"] for r in strike_rows)))
-    print(f"{ticker}: {action} {WEEK_POSITION_LABELS[snapshot_type]} snapshot (${price:.2f}), "
-          f"{len(strike_rows)} near-strike contract rows across {n_strikes} strike levels.")
-    return df, strikes_df
+    msg = (f"{ticker}: {week_position} weekly row (${price:.2f}); "
+           f"{len(date_to_roles)} expiration(s) fetched, {n_strike_rows_total} near-strike rows.")
+    return msg, weekly_df, strikes_df, daily_df
 
 
 def main():
     if not should_run_now():
         return
 
-    df = load_existing()
+    weekly_df = load_existing()
     strikes_df = load_existing_strikes()
+    daily_df = load_existing_daily()
+
     risk_free_rate = fetch_risk_free_rate()
     for ticker in TICKERS:
-        df, strikes_df = upsert_snapshot(df, strikes_df, ticker, risk_free_rate)
+        msg, weekly_df, strikes_df, daily_df = process_ticker(
+            ticker, risk_free_rate, weekly_df, strikes_df, daily_df)
+        print(msg)
         time.sleep(REQUEST_DELAY_SECONDS)
 
-    save_all(df)
+    save_all(weekly_df)
     save_all_strikes(strikes_df)
-    print(f"\nDone. {len(df)} weekly summary rows ({CSV_PATH}), "
-          f"{len(strikes_df)} near-strike detail rows ({STRIKE_CSV_PATH}).")
+    save_all_daily(daily_df)
+    print(f"\nDone. {len(weekly_df)} weekly rows, {len(strikes_df)} near-strike rows, "
+          f"{len(daily_df)} daily price rows.")
 
 
 if __name__ == "__main__":
