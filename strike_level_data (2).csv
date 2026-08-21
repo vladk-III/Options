@@ -1,0 +1,1 @@
+ticker,snapshot_date,week_start,week_position,role,expiration_date,initial_length_bucket,trading_days_to_expiration,trading_days_to_target,option_type,strike_offset,strike,last_price,bid,ask,volume,open_interest,implied_volatility,delta,gamma,theta,vega,rho
