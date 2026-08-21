@@ -2,13 +2,22 @@ name: Collect Options Data
 
 on:
   schedule:
-    # Two triggers to survive the EST/EDT switch -- 10:30am ET is either
-    # 14:30 UTC (EDT, roughly Mar-Nov) or 15:30 UTC (EST, roughly Nov-Mar).
-    # collect_headless.py checks the real US/Eastern clock and skips the
-    # one that isn't actually ~10:30am local, so only one ever does
-    # anything on a given day.
-    - cron: '30 14 * * 1-5'
-    - cron: '30 15 * * 1-5'
+    # Several attempts spread across the morning, rather than a single
+    # exact-time trigger -- GitHub's scheduler is best-effort and can
+    # occasionally delay or drop an individual trigger, so giving it
+    # multiple independent chances (10:00, 10:30, 11:00 ET) makes an
+    # actual collection landing near 10:30 far more likely. Each one is
+    # near-instant if outside collect_headless.py's own ~40min window
+    # around 10:30 ET, so the extra attempts cost basically nothing.
+    # Both UTC offsets are listed for each target time to survive the
+    # EST/EDT switch automatically (collect_headless.py's own clock
+    # check decides which one, if any, actually collects).
+    - cron: '0 14 * * 1-5'   # 10:00 ET (EDT)
+    - cron: '30 14 * * 1-5'  # 10:30 ET (EDT)
+    - cron: '0 15 * * 1-5'   # 11:00 ET (EDT) / 10:00 ET (EST)
+    - cron: '30 15 * * 1-5'  # 10:30 ET (EST)
+    - cron: '0 16 * * 1-5'   # 12:00 ET (EDT, watchdog) / 11:00 ET (EST)
+    - cron: '0 17 * * 1-5'   # 12:00 ET (EST, watchdog)
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 permissions:
@@ -38,6 +47,8 @@ jobs:
           wc -l options_data.csv
           echo "--- strike_level_data.csv ---"
           wc -l strike_level_data.csv
+          echo "--- daily_data.csv ---"
+          wc -l daily_data.csv
           echo "--- .gitignore (if any) ---"
           cat .gitignore 2>/dev/null || echo "(no .gitignore file)"
           echo "--- git status ---"
@@ -47,6 +58,6 @@ jobs:
         run: |
           git config user.name "options-data-bot"
           git config user.email "actions@github.com"
-          git add options_data.csv strike_level_data.csv
+          git add options_data.csv strike_level_data.csv daily_data.csv
           git diff --staged --quiet || git commit -m "Update options data $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
