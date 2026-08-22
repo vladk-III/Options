@@ -2,22 +2,17 @@ name: Collect Options Data
 
 on:
   schedule:
-    # Several attempts spread across the morning, rather than a single
-    # exact-time trigger -- GitHub's scheduler is best-effort and can
-    # occasionally delay or drop an individual trigger, so giving it
-    # multiple independent chances (10:00, 10:30, 11:00 ET) makes an
-    # actual collection landing near 10:30 far more likely. Each one is
-    # near-instant if outside collect_headless.py's own ~40min window
-    # around 10:30 ET, so the extra attempts cost basically nothing.
-    # Both UTC offsets are listed for each target time to survive the
-    # EST/EDT switch automatically (collect_headless.py's own clock
-    # check decides which one, if any, actually collects).
-    - cron: '0 14 * * 1-5'   # 10:00 ET (EDT)
-    - cron: '30 14 * * 1-5'  # 10:30 ET (EDT)
-    - cron: '0 15 * * 1-5'   # 11:00 ET (EDT) / 10:00 ET (EST)
-    - cron: '30 15 * * 1-5'  # 10:30 ET (EST)
-    - cron: '0 16 * * 1-5'   # 12:00 ET (EDT, watchdog) / 11:00 ET (EST)
-    - cron: '0 17 * * 1-5'   # 12:00 ET (EST, watchdog)
+    # Real-world testing showed GitHub's scheduled-run delay can run well
+    # over an hour (one run landed 81 minutes late), so rather than
+    # targeting an exact time, this fires every 30 minutes across market
+    # hours (13:00-21:00 UTC covers ~9am-5pm ET across both EDT and EST,
+    # generously bounding either DST regime). collect_headless.py's own
+    # logic makes the FIRST invocation each day that actually lands during
+    # market hours do the real collection; every later invocation that day
+    # sees today's data already exists and exits immediately (cheap, no
+    # API calls) -- so this frequent schedule costs almost nothing while
+    # being far more resilient to GitHub's delivery unpredictability.
+    - cron: '*/30 13-21 * * 1-5'
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 permissions:
