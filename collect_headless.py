@@ -98,9 +98,8 @@ STRIKE_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stri
 DAILY_COLUMNS = ["ticker", "snapshot_date", "price"]
 DAILY_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_data.csv")
 
-TARGET_HOUR, TARGET_MINUTE = 10, 30
-WINDOW_MINUTES = 40
-ALERT_HOUR, ALERT_MINUTE = 12, 0
+MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE = 9, 30
+MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE = 16, 0
 
 
 # ---------------------------------------------------------
@@ -187,6 +186,15 @@ def already_collected_today():
 
 
 def should_run_now():
+    """No more narrow time-window targeting -- real-world testing showed
+    GitHub's scheduled-run delay can run well over an hour, which a tight
+    window can't absorb. Instead: this fires many times a day (see
+    collect.yml's every-30-min cron), and the FIRST invocation that lands
+    during market hours on a given day does the actual collection --
+    every later invocation that same day sees today's data already
+    exists and just exits immediately (cheap, no API calls). If nothing
+    has collected by market close, the run fails on purpose so GitHub's
+    failure-notification email becomes your alert."""
     if os.environ.get("FORCE_RUN") == "true":
         print("Manually triggered -- running regardless of time.")
         return True
@@ -196,18 +204,23 @@ def should_run_now():
         print(f"{current}: weekend -- skipping.")
         return False
 
-    target = current.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
-    if abs((current - target).total_seconds()) <= WINDOW_MINUTES * 60:
+    if already_collected_today():
+        print(f"{current}: already collected today -- skipping.")
+        return False
+
+    market_open = current.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
+    market_close = current.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+
+    if market_open <= current <= market_close:
         return True
 
-    alert_time = current.replace(hour=ALERT_HOUR, minute=ALERT_MINUTE, second=0, microsecond=0)
-    if current >= alert_time and not already_collected_today():
-        print(f"ALERT: it's {current} and nothing has been collected today. "
+    if current > market_close:
+        print(f"ALERT: it's {current} (past market close) and nothing has been collected today. "
               f"Failing this run on purpose so GitHub emails you about it -- "
               f"trigger 'Run workflow' manually to collect today's data.")
         sys.exit(1)
 
-    print(f"{current}: not within {WINDOW_MINUTES} min of {TARGET_HOUR}:{TARGET_MINUTE:02d} ET -- skipping.")
+    print(f"{current}: before market open -- skipping.")
     return False
 
 
