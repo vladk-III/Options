@@ -62,6 +62,7 @@ TICKER_YF_SYMBOL = {
     "VIX": "^VIX", "ETHA": "ETHA", "META": "META", "SLV": "SLV", "NFLX": "NFLX",
     "PFE": "PFE", "SOFI": "SOFI", "COIN": "COIN", "GOOGL": "GOOGL", "PLTR": "PLTR",
     "SHOP": "SHOP", "SQ": "SQ", "XOM": "XOM", "AMD": "AMD", "BAC": "BAC",
+    "FIG": "FIG", "RKLB": "RKLB", "SPCX": "SPCX",
 }
 TICKERS = list(TICKER_YF_SYMBOL.keys())
 
