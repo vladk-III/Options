@@ -50,6 +50,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import holidays
 from scipy.stats import norm
 
 # ---------------------------------------------------------
@@ -119,20 +120,60 @@ def get_week_start(d=None):
     return d - datetime.timedelta(days=d.weekday())
 
 
+NYSE_HOLIDAYS = holidays.financial_holidays("NYSE")
+
+
+def is_market_holiday(d):
+    return d in NYSE_HOLIDAYS
+
+
+def first_trading_day_of_week(d):
+    """The actual first trading day of d's week -- normally Monday, but
+    walks forward past weekends/NYSE holidays if Monday itself is closed
+    (e.g. MLK Day, Presidents Day, Memorial Day, Labor Day -- all always
+    fall on a Monday)."""
+    monday = d - datetime.timedelta(days=d.weekday())
+    candidate = monday
+    while candidate.weekday() >= 5 or is_market_holiday(candidate):
+        candidate += datetime.timedelta(days=1)
+    return candidate
+
+
+def last_trading_day_of_week(d):
+    """The actual last trading day of d's week -- normally Friday, but
+    walks backward past NYSE holidays if Friday itself is closed (Good
+    Friday, and whichever of Juneteenth/July 4th/Christmas happens to
+    land on or get observed on a Friday that year)."""
+    monday = d - datetime.timedelta(days=d.weekday())
+    friday = monday + datetime.timedelta(days=4)
+    candidate = friday
+    while candidate.weekday() >= 5 or is_market_holiday(candidate):
+        candidate -= datetime.timedelta(days=1)
+    return candidate
+
+
 def determine_snapshot_type(d=None):
-    """Mon/Tue -> start, Wed -> intermediate, Thu/Fri/weekend -> end."""
+    """Holiday-aware: 'start' is genuinely the week's first trading day
+    (Monday normally, later in the week if Monday's a market holiday),
+    'end' is genuinely the week's last trading day (Friday normally,
+    earlier if Friday's a market holiday -- Good Friday is the common
+    case). Everything else that week is 'intermediate'. A run that
+    happens to land ON a holiday itself (stale data, market's closed)
+    won't match either boundary and correctly falls through to
+    'intermediate' rather than being mislabeled as authoritative."""
     d = d or today_et()
-    wd = d.weekday()
-    if wd in (0, 1):
+    if d.weekday() >= 5:
+        return "end"  # weekend collection just reflects Friday's frozen close
+    if d == first_trading_day_of_week(d):
         return "start"
-    if wd == 2:
-        return "intermediate"
-    return "end"
+    if d == last_trading_day_of_week(d):
+        return "end"
+    return "intermediate"
 
 
 def next_trading_day(d):
     nd = d + datetime.timedelta(days=1)
-    while nd.weekday() >= 5:
+    while nd.weekday() >= 5 or is_market_holiday(nd):
         nd += datetime.timedelta(days=1)
     return nd
 
@@ -143,15 +184,16 @@ def upcoming_friday(d):
 
 
 def trading_days_between(start_date, end_date):
-    """Number of weekday steps from start_date (exclusive) to end_date
-    (inclusive). 0 if end_date <= start_date."""
+    """Number of actual trading-day steps from start_date (exclusive) to
+    end_date (inclusive) -- excludes weekends AND NYSE holidays. 0 if
+    end_date <= start_date."""
     if end_date <= start_date:
         return 0
     count = 0
     d = start_date
     while d < end_date:
         d += datetime.timedelta(days=1)
-        if d.weekday() < 5:
+        if d.weekday() < 5 and not is_market_holiday(d):
             count += 1
     return count
 
@@ -588,23 +630,45 @@ def process_ticker(ticker, risk_free_rate, weekly_df, strikes_df, daily_df):
     else:
         weekly_df = pd.concat([weekly_df, pd.DataFrame([wrow])], ignore_index=True)
 
-    # daily price ledger, DAILY_TICKERS only -- the target series for next-day prediction
-    if ticker in DAILY_TICKERS:
-        dmask = (daily_df["ticker"] == ticker) & (daily_df["snapshot_date"] == today_str)
-        drow = {"ticker": ticker, "snapshot_date": today_str, "price": price}
-        if dmask.any():
-            for k, v in drow.items():
-                daily_df.loc[dmask, k] = v
-        else:
-            daily_df = pd.concat([daily_df, pd.DataFrame([drow])], ignore_index=True)
+    # Daily price ledger -- ALL tickers, not just DAILY_TICKERS. The price
+    # is already fetched above for every ticker regardless of group (it's
+    # needed for near-strike selection either way), so persisting it here
+    # is free -- no extra API calls. This is what lets the RNN (which
+    # pools all 33 tickers) have genuine daily price targets for everyone,
+    # not just the 11 daily-target tickers the weekly/next-day models use.
+    dmask = (daily_df["ticker"] == ticker) & (daily_df["snapshot_date"] == today_str)
+    drow = {"ticker": ticker, "snapshot_date": today_str, "price": price}
+    if dmask.any():
+        for k, v in drow.items():
+            daily_df.loc[dmask, k] = v
+    else:
+        daily_df = pd.concat([daily_df, pd.DataFrame([drow])], ignore_index=True)
 
     msg = (f"{ticker}: {week_position} weekly row (${price:.2f}); "
            f"{len(date_to_roles)} expiration(s) fetched, {n_strike_rows_total} near-strike rows.")
     return msg, weekly_df, strikes_df, daily_df
 
 
+def emit_workflow_output(**kwargs):
+    """Writes key=value pairs to $GITHUB_OUTPUT so later workflow steps can
+    branch on them (used to fire the 'data is ready' email only on the run
+    that actually collected). No-ops outside GitHub Actions."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            for k, v in kwargs.items():
+                f.write(f"{k}={v}\n")
+    except Exception as e:
+        print(f"(could not write workflow output: {e})")
+
+
 def main():
     if not should_run_now():
+        # Either not a trading window, or today's data already exists. Either
+        # way this is NOT the first successful pull, so no email.
+        emit_workflow_output(collected="false")
         return
 
     weekly_df = load_existing()
@@ -612,10 +676,15 @@ def main():
     daily_df = load_existing_daily()
 
     risk_free_rate = fetch_risk_free_rate()
+    ok, failed = 0, []
     for ticker in TICKERS:
         msg, weekly_df, strikes_df, daily_df = process_ticker(
             ticker, risk_free_rate, weekly_df, strikes_df, daily_df)
         print(msg)
+        if "could not fetch" in msg:
+            failed.append(ticker)
+        else:
+            ok += 1
         time.sleep(REQUEST_DELAY_SECONDS)
 
     save_all(weekly_df)
@@ -623,6 +692,23 @@ def main():
     save_all_daily(daily_df)
     print(f"\nDone. {len(weekly_df)} weekly rows, {len(strikes_df)} near-strike rows, "
           f"{len(daily_df)} daily price rows.")
+
+    # Because should_run_now() bails out when today's data already exists,
+    # reaching this point means this run IS today's first successful pull.
+    today = today_et()
+    emit_workflow_output(
+        collected="true",
+        collected_date=today.isoformat(),
+        collected_weekday=today.strftime("%A"),
+        collected_time_et=now_et().strftime("%H:%M ET"),
+        tickers_ok=str(ok),
+        tickers_failed=str(len(failed)),
+        failed_list=", ".join(failed) if failed else "none",
+        snapshot_type=determine_snapshot_type(today),
+        weekly_rows=str(len(weekly_df)),
+        strike_rows=str(len(strikes_df)),
+        daily_rows=str(len(daily_df)),
+    )
 
 
 if __name__ == "__main__":
