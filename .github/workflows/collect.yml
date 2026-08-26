@@ -32,6 +32,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run collection
+        id: collect
         run: python collect_headless.py
         env:
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
@@ -56,3 +57,45 @@ jobs:
           git add options_data.csv strike_level_data.csv daily_data.csv
           git diff --staged --quiet || git commit -m "Update options data $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
+
+      # Fires ONLY on the run that actually collected. Because
+      # collect_headless.py exits early when today's data already exists,
+      # that run is by definition today's FIRST successful pull -- every
+      # later run the same day sets collected=false and is skipped here.
+      # Setup: add these repo secrets (Settings > Secrets and variables >
+      # Actions). For Gmail, MAIL_PASSWORD must be a 16-char App Password
+      # (Google account > Security > 2-Step Verification > App passwords),
+      # NOT your normal account password:
+      #   MAIL_USERNAME  - the sending Gmail address
+      #   MAIL_PASSWORD  - that App Password
+      #   MAIL_TO        - where to send it (can be the same address)
+      - name: Email -- data ready
+        if: steps.collect.outputs.collected == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.MAIL_TO }}
+          from: Options Collector
+          subject: >-
+            Options data ready --
+            ${{ steps.collect.outputs.collected_date }}
+            (${{ steps.collect.outputs.snapshot_type }})
+          body: |
+            Today's options data has been collected and pushed. Ready to run the model.
+
+            Collected : ${{ steps.collect.outputs.collected_weekday }}, ${{ steps.collect.outputs.collected_date }} at ${{ steps.collect.outputs.collected_time_et }}
+            Snapshot  : ${{ steps.collect.outputs.snapshot_type }}
+
+            Tickers OK     : ${{ steps.collect.outputs.tickers_ok }}
+            Tickers failed : ${{ steps.collect.outputs.tickers_failed }} (${{ steps.collect.outputs.failed_list }})
+
+            Totals now in the repo:
+              options_data.csv       ${{ steps.collect.outputs.weekly_rows }} rows
+              strike_level_data.csv  ${{ steps.collect.outputs.strike_rows }} rows
+              daily_data.csv         ${{ steps.collect.outputs.daily_rows }} rows
+
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
