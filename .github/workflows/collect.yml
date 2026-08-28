@@ -13,6 +13,14 @@ on:
     # API calls) -- so this frequent schedule costs almost nothing while
     # being far more resilient to GitHub's delivery unpredictability.
     - cron: '*/30 13-21 * * 1-5'
+    # GitHub's cron scheduler can delay runs by HOURS during peak load --
+    # a run "scheduled" for 9am may not actually fire until the afternoon
+    # or evening. To compensate, we also fire every 30 min from 6am-9am
+    # ET (10-13 UTC), WELL before market open. should_run_now() won't
+    # collect before 9:30am ET regardless, but having the job already
+    # queued and waiting means it starts the instant the market-hours
+    # gate opens rather than waiting for GitHub's delayed dispatch.
+    - cron: '*/30 10-12 * * 1-5'
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 permissions:
